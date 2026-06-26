@@ -48,7 +48,7 @@ spindle.registerTool({
       },
     },
   },
-  council_eligible: false, // This tool is for the primary LLM, not Council
+  council_eligible: true, // This tool is for the primary LLM, not Council
 });
 
 spindle.log.info("SAO Cardinal System: Tool 'update_variables' registered.");
