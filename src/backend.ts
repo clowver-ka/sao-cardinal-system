@@ -45,7 +45,7 @@ async function buildSavePointTemplate(
   inGameDate: string,
   currentFloor: string
 ): Promise<string> {
-  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests", userId);
+  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests");
   const activeQuests = activeQuestsRaw ? activeQuestsRaw.split(",").map((q) => q.trim()) : [];
 
   let recentEvents: string[] = [];
@@ -180,9 +180,9 @@ async function processSavePoint(
   if (!isNewDay && !isManualSave) return false;
 
   const inGameDate =
-    (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE, userId)) || "Unknown Date";
+    (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE)) || "Unknown Date";
   const currentFloor =
-    (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, userId)) || "1";
+    (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE)) || "1";
 
   const template = await buildSavePointTemplate(chatId, userId, inGameDate, currentFloor);
 
