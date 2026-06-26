@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Save Point Backend
-// Handles: daily state snapshots, trigger detection, lorebook injection
+// SAO Cardinal System — Backend v0.5
+// Adds: variable parsing from LLM output via [SYS_VARS: ...] blocks
 // ─────────────────────────────────────────────────────────────
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
@@ -8,28 +8,48 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
 // ── Configuration ────────────────────────────────────────────
 
 const CONFIG = {
-  // The comment used to identify the current Save Point entry
   SAVE_POINT_COMMENT: "Save Point — Current",
-  // World Book name where Save Points are stored
   WORLD_BOOK_NAME: "SAO Save Points",
-  // Template for archived Save Point comments
   ARCHIVE_COMMENT_PREFIX: "Save Point — ",
-  // The variable key for tracking the last save date
   LAST_SAVE_VARIABLE: "last_save_date",
-  // The variable key for tracking in-game date
   IN_GAME_DATE_VARIABLE: "in_game_date",
-  // The variable key for tracking current floor
   CURRENT_FLOOR_VARIABLE: "current_floor",
 };
 
-// ── Helper: Detect a new in-game day ─────────────────────────
+// ── Variable Parsing ─────────────────────────────────────────
 
 /**
- * Scans the generated message text for phrases indicating a new day has started.
- * Returns true if we find "next morning", "the following day", "the next day", etc.
- * 
- * This is intentionally simple for v0.1. We can expand the pattern list later.
+ * Scans text for [SYS_VARS: key1=value1, key2=value2] blocks.
+ * Returns the cleaned text (with blocks removed) and a map of extracted variables.
  */
+function extractVariables(text: string): { cleanedText: string; variables: Record<string, string> } {
+  const variables: Record<string, string> = {};
+  const sysVarsRegex = /\[SYS_VARS:\s*([^\]]+)\]/gi;
+
+  const cleanedText = text.replace(sysVarsRegex, (match, pairsStr) => {
+    // Parse key=value pairs, separated by commas
+    const pairs = pairsStr.split(",");
+    for (const pair of pairs) {
+      const eqIndex = pair.indexOf("=");
+      if (eqIndex === -1) continue;
+      const key = pair.substring(0, eqIndex).trim();
+      const value = pair.substring(eqIndex + 1).trim();
+      if (key && value) {
+        variables[key] = value;
+      }
+    }
+    return ""; // Remove the block from visible output
+  });
+
+  // Clean up any double-newlines left by removing the blocks
+  return {
+    cleanedText: cleanedText.replace(/\n{3,}/g, "\n\n").trim(),
+    variables,
+  };
+}
+
+// ── Helper: Detect a new in-game day ─────────────────────────
+
 function detectNewDay(text: string): boolean {
   const dayPatterns = [
     /\bthe next morning\b/i,
@@ -45,45 +65,32 @@ function detectNewDay(text: string): boolean {
   return dayPatterns.some((pattern) => pattern.test(text));
 }
 
-/**
- * Checks if the user sent a manual /save command.
- */
 function detectManualSave(userMessage: string): boolean {
   return /\bsave\b/i.test(userMessage) && userMessage.length < 20;
 }
 
-// ── Helper: Build the Save Point HTML template ────────────────
+// ── Save Point Template ──────────────────────────────────────
 
-/**
- * Assembles the full Save Point template from all available data sources.
- * This mirrors the behavior spec: queries Variables, World Books, and Memory Cortex,
- * then builds the collapsible <details> block.
- */
 async function buildSavePointTemplate(
   chatId: string,
+  userId: string,
   inGameDate: string,
   currentFloor: string
 ): Promise<string> {
-  // ── Fetch Variables ──────────────────────────────────────
-  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests");
+  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests", userId);
   const activeQuests = activeQuestsRaw ? activeQuestsRaw.split(",").map((q) => q.trim()) : [];
 
-  // ── Fetch Memory Cortex data (if available) ──────────────
   let recentEvents: string[] = [];
   let characterThoughts: string[] = [];
   try {
-    // Try to get recent cortex memories
     const cortexResult = await spindle.memories.cortex.query({
-      chatId,
-      queryText: "recent events today",
-      topK: 5,
+      chatId, queryText: "recent events today", topK: 5, userId,
     });
     recentEvents = cortexResult.memories.map((m) => m.content);
 
-    // Get active entities for character status
-    const entities = await spindle.memories.entities.list(chatId, { activeOnly: true });
+    const entities = await spindle.memories.entities.list(chatId, { activeOnly: true, userId });
     for (const entity of entities.slice(0, 10)) {
-      const facts = await spindle.memories.entities.getFacts(entity.id);
+      const facts = await spindle.memories.entities.getFacts(entity.id, userId);
       const thoughts = facts ? facts.slice(0, 1).join(" ") : "No recent data.";
       characterThoughts.push(
         `<div style="font-weight: 600; color: #1a1a1a;">${entity.name}</div>
@@ -91,163 +98,73 @@ async function buildSavePointTemplate(
       );
     }
   } catch {
-    // Memory Cortex might not be available—degrade gracefully
     recentEvents = ["Memory Cortex unavailable. Limited tracking active."];
     characterThoughts = ["Character data unavailable."];
   }
 
-  // ── Build Recent Developments ────────────────────────────
-  const developmentsHTML = recentEvents
-    .map((event) => `<div style="padding: 3px 0;">• ${event}</div>`)
-    .join("\n");
-
-  // ── Build Character Status ───────────────────────────────
-  const characterHTML = characterThoughts
-    .map(
-      (thought) =>
-        `<div style="font-size: 0.82em; padding: 8px 10px; background: #f8f9fa; margin-bottom: 6px;">${thought}</div>`
-    )
-    .join("\n");
-
-  // ── Build Active Quests ──────────────────────────────────
+  const developmentsHTML = recentEvents.map((e) => `<div style="padding: 3px 0;">• ${e}</div>`).join("\n");
+  const characterHTML = characterThoughts.map((t) =>
+    `<div style="font-size: 0.82em; padding: 8px 10px; background: #f8f9fa; margin-bottom: 6px;">${t}</div>`
+  ).join("\n");
   const questsHTML = activeQuests.length
-    ? activeQuests
-        .map(
-          (quest) =>
-            `<div style="padding: 4px 0; border-bottom: 1px dotted #e0e3e7;">
-              <span style="font-weight: 600; color: #1a1a1a;">${quest}</span>
-              <span style="color: #6b7280;"> — Status: Active</span>
-            </div>`
-        )
-        .join("\n")
+    ? activeQuests.map((q) =>
+        `<div style="padding: 4px 0; border-bottom: 1px dotted #e0e3e7;">
+          <span style="font-weight: 600; color: #1a1a1a;">${q}</span>
+          <span style="color: #6b7280;"> — Status: Active</span></div>`
+      ).join("\n")
     : `<div style="padding: 4px 0; color: #8a8f94;">No active quests.</div>`;
 
-  // ── Assemble Full Template ───────────────────────────────
-  return `
-<details style='background: #ffffff; color: #2d2d2d; border: 1px solid #b0b4b8; max-width: 620px; font-family: "Segoe UI", "Roboto", "Noto Sans", system-ui, sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,0.15); margin: 0 auto;'>
+  return `<details style='background: #ffffff; color: #2d2d2d; border: 1px solid #b0b4b8; max-width: 620px; font-family: "Segoe UI", "Roboto", "Noto Sans", system-ui, sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,0.15); margin: 0 auto;'>
   <summary style='background: #ffffff; border-bottom: 1px solid #F1DC46; padding: 12px 16px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; list-style: none;'>
-    <div>
-      <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 2px;'>System — Save Point</div>
-      <div style='font-size: 0.92em; font-weight: 600; color: #1a1a1a;'>${inGameDate} — Floor ${currentFloor}</div>
-    </div>
+    <div><div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 2px;'>System — Save Point</div>
+    <div style='font-size: 0.92em; font-weight: 600; color: #1a1a1a;'>${inGameDate} — Floor ${currentFloor}</div></div>
     <div style='font-size: 0.68em; color: #F1DC46; font-weight: 600; letter-spacing: 0.04em;'>▼ EXPAND</div>
   </summary>
-
   <div style='padding: 18px 20px;'>
-
-    <!-- Active Quests -->
-    <div style='margin-bottom: 16px;'>
-      <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📋 Active Quests</div>
-      <div style='font-size: 0.8em;'>
-        ${questsHTML}
-      </div>
-    </div>
-
-    <!-- Character Status -->
-    <div style='margin-bottom: 16px;'>
-      <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>👥 Character Status</div>
-      ${characterHTML}
-    </div>
-
-    <!-- Recent Developments -->
-    <div style='margin-bottom: 16px;'>
-      <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📊 Recent Developments</div>
-      <div style='font-size: 0.8em;'>
-        ${developmentsHTML}
-      </div>
-    </div>
-
-  </div>
-</details>`;
+    <div style='margin-bottom: 16px;'><div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📋 Active Quests</div><div style='font-size: 0.8em;'>${questsHTML}</div></div>
+    <div style='margin-bottom: 16px;'><div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>👥 Character Status</div>${characterHTML}</div>
+    <div style='margin-bottom: 16px;'><div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📊 Recent Developments</div><div style='font-size: 0.8em;'>${developmentsHTML}</div></div>
+  </div></details>`;
 }
 
-// ── Helper: Find or create the Save Point World Book ──────────
+// ── World Book Helpers ───────────────────────────────────────
 
-/**
- * Searches for an existing Save Point world book, or creates one if not found.
- * Returns the world book ID.
- */
-async function getOrCreateSavePointBook(): Promise<string> {
-  const { data: books } = await spindle.world_books.list({ limit: 50 });
+async function getOrCreateSavePointBook(userId: string): Promise<string> {
+  const { data: books } = await spindle.world_books.list({ limit: 50, userId });
   const existing = books.find((b) => b.name === CONFIG.WORLD_BOOK_NAME);
   if (existing) return existing.id;
-
-  const newBook = await spindle.world_books.create({
-    name: CONFIG.WORLD_BOOK_NAME,
-    description: "Automated Save Point entries generated by the SAO Cardinal System extension.",
-  });
+  const newBook = await spindle.world_books.create({ name: CONFIG.WORLD_BOOK_NAME, description: "Automated Save Point entries.", userId });
   return newBook.id;
 }
 
-// ── Helper: Archive the previous Save Point ──────────────────
-
-/**
- * Finds the current Save Point entry (constant: true) and archives it:
- * sets constant: false, updates the comment with the archive prefix + date.
- */
-async function archivePreviousSavePoint(bookId: string, date: string): Promise<void> {
-  const { data: entries } = await spindle.world_books.entries.list(bookId, { limit: 100 });
+async function archivePreviousSavePoint(bookId: string, date: string, userId: string): Promise<void> {
+  const { data: entries } = await spindle.world_books.entries.list(bookId, { limit: 100, userId });
   const currentEntry = entries.find((e) => e.comment === CONFIG.SAVE_POINT_COMMENT);
-
   if (currentEntry) {
-    await spindle.world_books.entries.update(currentEntry.id, {
-      constant: false,
-      comment: `${CONFIG.ARCHIVE_COMMENT_PREFIX}${date}`,
-    });
+    await spindle.world_books.entries.update(currentEntry.id, { constant: false, comment: `${CONFIG.ARCHIVE_COMMENT_PREFIX}${date}`, userId });
   }
 }
 
-// ── Helper: Write the new Save Point entry ───────────────────
-
-/**
- * Creates a new Save Point entry in the world book.
- * Sets constant: true so it's always injected into context.
- * Sets position: 0 (before chat history) and priority: 100 (highest).
- */
-async function writeSavePoint(bookId: string, content: string): Promise<void> {
-  await spindle.world_books.entries.create(bookId, {
-    key: ["save_point", "daily_summary", "cardinal_system"],
-    content,
-    comment: CONFIG.SAVE_POINT_COMMENT,
-    constant: true,
-    position: 0,
-    priority: 100,
-  });
+async function writeSavePoint(bookId: string, content: string, userId: string): Promise<void> {
+  await spindle.world_books.entries.create(bookId, { key: ["save_point", "daily_summary", "cardinal_system"], content, comment: CONFIG.SAVE_POINT_COMMENT, constant: true, position: 0, priority: 100, userId });
 }
 
-// ── Main: Process a potential Save Point trigger ─────────────
+// ── Main Logic ───────────────────────────────────────────────
 
-/**
- * The core logic. Checks if a Save Point should fire, and if so,
- * builds the template, archives the old entry, and writes the new one.
- */
-async function processSavePoint(
-  chatId: string,
-  userMessage: string,
-  generatedText: string
-): Promise<boolean> {
-  // ── Check trigger conditions ────────────────────────────
+async function processSavePoint(chatId: string, userId: string, userMessage: string, generatedText: string): Promise<boolean> {
   const isNewDay = detectNewDay(generatedText);
   const isManualSave = detectManualSave(userMessage);
-  
   if (!isNewDay && !isManualSave) return false;
 
-  // ── Get current state from Variables ────────────────────
-  const inGameDate = (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE)) || "Unknown Date";
-  const currentFloor = (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE)) || "1";
+  const inGameDate = (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE, userId)) || "Unknown Date";
+  const currentFloor = (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, userId)) || "1";
+  const template = await buildSavePointTemplate(chatId, userId, inGameDate, currentFloor);
 
-  // ── Build the template ──────────────────────────────────
-  const template = await buildSavePointTemplate(chatId, inGameDate, currentFloor);
-
-  // ── Write to World Book ─────────────────────────────────
   try {
-    const bookId = await getOrCreateSavePointBook();
-    await archivePreviousSavePoint(bookId, inGameDate);
-    await writeSavePoint(bookId, template);
-
-    // Update the last save date variable
-    await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate);
-
+    const bookId = await getOrCreateSavePointBook(userId);
+    await archivePreviousSavePoint(bookId, inGameDate, userId);
+    await writeSavePoint(bookId, template, userId);
+    await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate, userId);
     spindle.log.info(`Save Point written for ${inGameDate} (Floor ${currentFloor})`);
     return true;
   } catch (err) {
@@ -256,28 +173,51 @@ async function processSavePoint(
   }
 }
 
-// ── Register the Interceptor ─────────────────────────────────
+// ── Interceptor ──────────────────────────────────────────────
 
-/**
- * Hooks into every message-sent event. After the LLM generates a response,
- * we check if a Save Point trigger condition was met and process accordingly.
- */
 spindle.registerInterceptor(async (messages, ctx) => {
-  // We only care about the last user message and the generated response
-  const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-  const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
+  // Find the last assistant message (the LLM's just-generated response)
+  const assistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
+  if (!assistantMsg) return messages;
 
-  if (lastUserMsg && lastAssistantMsg) {
-    const chatId = ctx.chatId;
-    const userText = typeof lastUserMsg.content === "string" ? lastUserMsg.content : "";
-    const generatedText = typeof lastAssistantMsg.content === "string" ? lastAssistantMsg.content : "";
+  const rawContent = typeof assistantMsg.content === "string" ? assistantMsg.content : "";
+  
+  // Step 1: Extract [SYS_VARS: ...] blocks and update variables
+  const { cleanedText, variables } = extractVariables(rawContent);
+  
+  if (Object.keys(variables).length > 0) {
+    // Determine userId — use the install_scope: user manifest setting,
+    // which means the extension runs in user context and we can try
+    // spindle.chats.get to get the userId, or use a fallback
+    let userId = "";
+    try {
+      const chat = await spindle.chats.get(ctx.chatId);
+      userId = (chat as any).userId || (chat as any).ownerId || "";
+    } catch {
+      // If chats.get also needs userId, we'll catch it below
+    }
 
-    // Process Save Point (fire-and-forget—we don't modify the messages)
-    await processSavePoint(chatId, userText, generatedText);
+    if (userId) {
+      for (const [key, value] of Object.entries(variables)) {
+        await spindle.variables.chat.set(ctx.chatId, key, value, userId);
+        spindle.log.info(`Variable set: ${key} = ${value}`);
+      }
+
+      // Step 2: Check if a Save Point should fire
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+      const userText = lastUserMsg && typeof lastUserMsg.content === "string" ? lastUserMsg.content : "";
+      await processSavePoint(ctx.chatId, userId, userText, rawContent);
+
+      // Step 3: Strip the [SYS_VARS] block from the visible message
+      if (cleanedText !== rawContent) {
+        assistantMsg.content = cleanedText;
+      }
+    } else {
+      spindle.log.warn("Could not determine userId for variable update. Skipping.");
+    }
   }
 
-  // Always return messages unchanged—we're observing, not modifying
   return messages;
 });
 
-spindle.log.info("SAO Cardinal System: Save Point interceptor registered.");
+spindle.log.info("SAO Cardinal System: Backend v0.5 loaded — variable parsing active.");
