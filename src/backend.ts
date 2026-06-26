@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Save Point Backend (v0.2)
-// Fix: userId passed explicitly for operator-scoped compatibility
+// SAO Cardinal System — Save Point Backend (v0.3)
+// Fix: fetch userId from chat object instead of ctx.userId
 // ─────────────────────────────────────────────────────────────
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
@@ -16,18 +16,37 @@ const CONFIG = {
   CURRENT_FLOOR_VARIABLE: "current_floor",
 };
 
-// ── Helper: Extract userId from interceptor context ──────────
+// ── Cached userId (fetched once from chat object) ────────────
+
+let cachedUserId: string | null = null;
 
 /**
- * The interceptor context may include userId directly, or we may need
- * to fall back to a default. For operator-scoped extensions, userId
- * MUST be passed to every user-data API call.
+ * Gets the userId by querying the chat object.
+ * The chat's owner is the user we need for all subsequent API calls.
+ * Result is cached so we only make this query once per session.
  */
-function getUserId(ctx: { chatId: string; userId?: string }): string {
-  if (ctx.userId) return ctx.userId;
-  // Fallback: if ctx doesn't have userId, log a warning and return empty.
-  // This should not happen in normal operation, but prevents crashes.
-  spindle.log.warn("No userId in interceptor context. API calls may fail.");
+async function getUserId(chatId: string): Promise<string> {
+  if (cachedUserId) return cachedUserId;
+
+  try {
+    // spindle.chats.get returns the chat object, which includes userId/ownerId
+    const chat = await spindle.chats.get(chatId);
+    if (chat && chat.userId) {
+      cachedUserId = chat.userId;
+      spindle.log.info(`UserId cached from chat: ${cachedUserId}`);
+      return cachedUserId;
+    }
+    // Fallback: some API versions use ownerId
+    if (chat && (chat as any).ownerId) {
+      cachedUserId = (chat as any).ownerId;
+      spindle.log.info(`UserId cached from chat (ownerId): ${cachedUserId}`);
+      return cachedUserId;
+    }
+  } catch (err) {
+    spindle.log.error(`Failed to fetch chat for userId: ${err}`);
+  }
+
+  spindle.log.warn("Could not determine userId from chat. Save Point will be skipped.");
   return "";
 }
 
@@ -60,11 +79,9 @@ async function buildSavePointTemplate(
   inGameDate: string,
   currentFloor: string
 ): Promise<string> {
-  // ── Fetch Variables ──────────────────────────────────────
   const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests", userId);
   const activeQuests = activeQuestsRaw ? activeQuestsRaw.split(",").map((q) => q.trim()) : [];
 
-  // ── Fetch Memory Cortex data ─────────────────────────────
   let recentEvents: string[] = [];
   let characterThoughts: string[] = [];
   try {
@@ -90,7 +107,6 @@ async function buildSavePointTemplate(
     characterThoughts = ["Character data unavailable."];
   }
 
-  // ── Build HTML sections ──────────────────────────────────
   const developmentsHTML = recentEvents
     .map((event) => `<div style="padding: 3px 0;">• ${event}</div>`)
     .join("\n");
@@ -114,7 +130,6 @@ async function buildSavePointTemplate(
         .join("\n")
     : `<div style="padding: 4px 0; color: #8a8f94;">No active quests.</div>`;
 
-  // ── Assemble Full Template ───────────────────────────────
   return `
 <details style='background: #ffffff; color: #2d2d2d; border: 1px solid #b0b4b8; max-width: 620px; font-family: "Segoe UI", "Roboto", "Noto Sans", system-ui, sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,0.15); margin: 0 auto;'>
   <summary style='background: #ffffff; border-bottom: 1px solid #F1DC46; padding: 12px 16px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; list-style: none;'>
@@ -223,9 +238,10 @@ async function processSavePoint(
 // ── Register the Interceptor ─────────────────────────────────
 
 spindle.registerInterceptor(async (messages, ctx) => {
-  const userId = getUserId(ctx);
+  // Fetch userId from chat object (cached after first call)
+  const userId = await getUserId(ctx.chatId);
   if (!userId) {
-    spindle.log.warn("Save Point interceptor skipped: no userId available.");
+    spindle.log.warn("Save Point interceptor skipped: could not determine userId.");
     return messages;
   }
 
@@ -243,4 +259,4 @@ spindle.registerInterceptor(async (messages, ctx) => {
   return messages;
 });
 
-spindle.log.info("SAO Cardinal System: Save Point interceptor registered (operator-scoped compatible).");
+spindle.log.info("SAO Cardinal System: Save Point interceptor registered (v0.3 — userId from chat).");
