@@ -78,7 +78,8 @@ function detectCombatEnd(text: string): boolean {
  * Looks for common date formats: "November 6, 2022" or "November 6 2022"
  */
 function extractDate(text: string): string | null {
-  const match = text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b/i);
+  // Match "November 7, 2022" or "November 7 2022" or "November 7th, 2022" or "November 7th 2022"
+  const match = text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i);
   if (match) return `${match[1]} ${match[2]} ${match[3]}`;
   return null;
 }
