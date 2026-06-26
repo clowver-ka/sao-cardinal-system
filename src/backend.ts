@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Backend v0.5
-// Adds: variable parsing from LLM output via [SYS_VARS: ...] blocks
+// SAO Cardinal System — Backend v1.0
+// Tool-based variable management with automatic Save Point triggering
 // ─────────────────────────────────────────────────────────────
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
@@ -16,60 +16,102 @@ const CONFIG = {
   CURRENT_FLOOR_VARIABLE: "current_floor",
 };
 
-// ── Variable Parsing ─────────────────────────────────────────
+// ── Tool: update_variables ───────────────────────────────────
 
-/**
- * Scans text for [SYS_VARS: key1=value1, key2=value2] blocks.
- * Returns the cleaned text (with blocks removed) and a map of extracted variables.
- */
-function extractVariables(text: string): { cleanedText: string; variables: Record<string, string> } {
-  const variables: Record<string, string> = {};
-  const sysVarsRegex = /\[SYS_VARS:\s*([^\]]+)\]/gi;
+spindle.tools.register(
+  {
+    id: "update_variables",
+    description:
+      "Update chat variables that track story state—date, floor, combat status, party members, and active quests. The extension automatically triggers a Save Point when in_game_date changes. Call this whenever story-state changes: a new day begins, the party changes floors, combat starts/ends, quests are accepted/completed, or party membership changes.",
+    parameters: {
+      type: "object",
+      properties: {
+        in_game_date: {
+          type: "string",
+          description: 'Current in-game date, e.g. "November 6 2022". Update when a new day begins.',
+        },
+        current_floor: {
+          type: "string",
+          description: 'Current floor number as a string, e.g. "2". Update when the party changes floors.',
+        },
+        combat_active: {
+          type: "string",
+          description: '"true" or "false". Set when combat starts or ends.',
+        },
+        party_members: {
+          type: "string",
+          description: 'Comma-separated list of current party member names. Update when the party changes.',
+        },
+        active_quests: {
+          type: "string",
+          description: 'Comma-separated list of active quest names. Update when quests are accepted or completed.',
+        },
+      },
+    },
+  },
+  async (args, userId) => {
+    // ── Determine chatId ──────────────────────────────────
+    // The tool context may include chatId. If not, we need an alternative.
+    // For now, we log and attempt to infer from available context.
+    const chatId = (args as any)._chatId || "";
+    if (!chatId) {
+      spindle.log.warn("update_variables called without chatId. Variables not updated.");
+      return { success: false, error: "No chatId available." };
+    }
 
-  const cleanedText = text.replace(sysVarsRegex, (match, pairsStr) => {
-    // Parse key=value pairs, separated by commas
-    const pairs = pairsStr.split(",");
-    for (const pair of pairs) {
-      const eqIndex = pair.indexOf("=");
-      if (eqIndex === -1) continue;
-      const key = pair.substring(0, eqIndex).trim();
-      const value = pair.substring(eqIndex + 1).trim();
-      if (key && value) {
-        variables[key] = value;
+    if (!userId) {
+      spindle.log.warn("update_variables called without userId. Variables not updated.");
+      return { success: false, error: "No userId available." };
+    }
+
+    // ── Filter out non-variable fields ────────────────────
+    const validKeys = ["in_game_date", "current_floor", "combat_active", "party_members", "active_quests"];
+    const updates: Record<string, string> = {};
+    for (const key of validKeys) {
+      if ((args as any)[key] !== undefined) {
+        updates[key] = String((args as any)[key]);
       }
     }
-    return ""; // Remove the block from visible output
-  });
 
-  // Clean up any double-newlines left by removing the blocks
-  return {
-    cleanedText: cleanedText.replace(/\n{3,}/g, "\n\n").trim(),
-    variables,
-  };
-}
+    if (Object.keys(updates).length === 0) {
+      return { success: true, message: "No variables to update." };
+    }
 
-// ── Helper: Detect a new in-game day ─────────────────────────
+    // ── Write all variables ───────────────────────────────
+    for (const [key, value] of Object.entries(updates)) {
+      await spindle.variables.chat.set(chatId, key, value, userId);
+      spindle.log.info(`Variable set: ${key} = ${value}`);
+    }
 
-function detectNewDay(text: string): boolean {
-  const dayPatterns = [
-    /\bthe next morning\b/i,
-    /\bthe following morning\b/i,
-    /\bthe following day\b/i,
-    /\bthe next day\b/i,
-    /\bwakes? up\b/i,
-    /\bwoke up\b/i,
-    /\bdawn broke\b/i,
-    /\bat sunrise\b/i,
-    /\bat dawn\b/i,
-  ];
-  return dayPatterns.some((pattern) => pattern.test(text));
-}
+    // ── Auto-trigger Save Point if date changed ───────────
+    if (updates[CONFIG.IN_GAME_DATE_VARIABLE]) {
+      const newDate = updates[CONFIG.IN_GAME_DATE_VARIABLE];
+      const currentFloor =
+        updates[CONFIG.CURRENT_FLOOR_VARIABLE] ||
+        (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, userId)) ||
+        "1";
 
-function detectManualSave(userMessage: string): boolean {
-  return /\bsave\b/i.test(userMessage) && userMessage.length < 20;
-}
+      try {
+        const bookId = await getOrCreateSavePointBook(userId);
+        await archivePreviousSavePoint(bookId, newDate, userId);
 
-// ── Save Point Template ──────────────────────────────────────
+        const template = await buildSavePointTemplate(chatId, userId, newDate, currentFloor);
+        await writeSavePoint(bookId, template, userId);
+        await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, newDate, userId);
+
+        spindle.log.info(`Save Point auto-triggered for ${newDate} (Floor ${currentFloor})`);
+      } catch (err) {
+        spindle.log.error(`Save Point auto-trigger failed: ${err}`);
+      }
+    }
+
+    return { success: true, updated: Object.keys(updates) };
+  }
+);
+
+spindle.log.info("SAO Cardinal System: Tool 'update_variables' registered.");
+
+// ── Save Point Template Builder ──────────────────────────────
 
 async function buildSavePointTemplate(
   chatId: string,
@@ -133,7 +175,11 @@ async function getOrCreateSavePointBook(userId: string): Promise<string> {
   const { data: books } = await spindle.world_books.list({ limit: 50, userId });
   const existing = books.find((b) => b.name === CONFIG.WORLD_BOOK_NAME);
   if (existing) return existing.id;
-  const newBook = await spindle.world_books.create({ name: CONFIG.WORLD_BOOK_NAME, description: "Automated Save Point entries.", userId });
+  const newBook = await spindle.world_books.create({
+    name: CONFIG.WORLD_BOOK_NAME,
+    description: "Automated Save Point entries generated by the SAO Cardinal System extension.",
+    userId,
+  });
   return newBook.id;
 }
 
@@ -141,83 +187,24 @@ async function archivePreviousSavePoint(bookId: string, date: string, userId: st
   const { data: entries } = await spindle.world_books.entries.list(bookId, { limit: 100, userId });
   const currentEntry = entries.find((e) => e.comment === CONFIG.SAVE_POINT_COMMENT);
   if (currentEntry) {
-    await spindle.world_books.entries.update(currentEntry.id, { constant: false, comment: `${CONFIG.ARCHIVE_COMMENT_PREFIX}${date}`, userId });
+    await spindle.world_books.entries.update(currentEntry.id, {
+      constant: false,
+      comment: `${CONFIG.ARCHIVE_COMMENT_PREFIX}${date}`,
+      userId,
+    });
   }
 }
 
 async function writeSavePoint(bookId: string, content: string, userId: string): Promise<void> {
-  await spindle.world_books.entries.create(bookId, { key: ["save_point", "daily_summary", "cardinal_system"], content, comment: CONFIG.SAVE_POINT_COMMENT, constant: true, position: 0, priority: 100, userId });
+  await spindle.world_books.entries.create(bookId, {
+    key: ["save_point", "daily_summary", "cardinal_system"],
+    content,
+    comment: CONFIG.SAVE_POINT_COMMENT,
+    constant: true,
+    position: 0,
+    priority: 100,
+    userId,
+  });
 }
 
-// ── Main Logic ───────────────────────────────────────────────
-
-async function processSavePoint(chatId: string, userId: string, userMessage: string, generatedText: string): Promise<boolean> {
-  const isNewDay = detectNewDay(generatedText);
-  const isManualSave = detectManualSave(userMessage);
-  if (!isNewDay && !isManualSave) return false;
-
-  const inGameDate = (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE, userId)) || "Unknown Date";
-  const currentFloor = (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, userId)) || "1";
-  const template = await buildSavePointTemplate(chatId, userId, inGameDate, currentFloor);
-
-  try {
-    const bookId = await getOrCreateSavePointBook(userId);
-    await archivePreviousSavePoint(bookId, inGameDate, userId);
-    await writeSavePoint(bookId, template, userId);
-    await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate, userId);
-    spindle.log.info(`Save Point written for ${inGameDate} (Floor ${currentFloor})`);
-    return true;
-  } catch (err) {
-    spindle.log.error(`Failed to write Save Point: ${err}`);
-    return false;
-  }
-}
-
-// ── Interceptor ──────────────────────────────────────────────
-
-spindle.registerInterceptor(async (messages, ctx) => {
-  // Find the last assistant message (the LLM's just-generated response)
-  const assistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
-  if (!assistantMsg) return messages;
-
-  const rawContent = typeof assistantMsg.content === "string" ? assistantMsg.content : "";
-  
-  // Step 1: Extract [SYS_VARS: ...] blocks and update variables
-  const { cleanedText, variables } = extractVariables(rawContent);
-  
-  if (Object.keys(variables).length > 0) {
-    // Determine userId — use the install_scope: user manifest setting,
-    // which means the extension runs in user context and we can try
-    // spindle.chats.get to get the userId, or use a fallback
-    let userId = "";
-    try {
-      const chat = await spindle.chats.get(ctx.chatId);
-      userId = (chat as any).userId || (chat as any).ownerId || "";
-    } catch {
-      // If chats.get also needs userId, we'll catch it below
-    }
-
-    if (userId) {
-      for (const [key, value] of Object.entries(variables)) {
-        await spindle.variables.chat.set(ctx.chatId, key, value, userId);
-        spindle.log.info(`Variable set: ${key} = ${value}`);
-      }
-
-      // Step 2: Check if a Save Point should fire
-      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-      const userText = lastUserMsg && typeof lastUserMsg.content === "string" ? lastUserMsg.content : "";
-      await processSavePoint(ctx.chatId, userId, userText, rawContent);
-
-      // Step 3: Strip the [SYS_VARS] block from the visible message
-      if (cleanedText !== rawContent) {
-        assistantMsg.content = cleanedText;
-      }
-    } else {
-      spindle.log.warn("Could not determine userId for variable update. Skipping.");
-    }
-  }
-
-  return messages;
-});
-
-spindle.log.info("SAO Cardinal System: Backend v0.5 loaded — variable parsing active.");
+spindle.log.info("SAO Cardinal System: Backend v1.0 loaded — tool-based architecture active.");
