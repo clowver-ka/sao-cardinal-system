@@ -16,4 +16,5 @@
   ],
   "entry_backend": "dist/backend.js",
   "minimum_lumiverse_version": "0.1.0"
+  "install_scope": "user"
 }
