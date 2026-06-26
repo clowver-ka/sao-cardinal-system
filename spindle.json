@@ -8,7 +8,6 @@
   "description": "Narrative management system for SAO roleplay—Save Points, Quest Prophecies, Unit System, Spotlights, and diegetic messaging.",
   "permissions": [
     "world_books",
-    "variables",
     "interceptor",
     "tools",
     "memories",
