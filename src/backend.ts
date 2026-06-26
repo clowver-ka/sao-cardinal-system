@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Save Point Backend
-// Handles: daily state snapshots, trigger detection, lorebook injection
+// SAO Cardinal System — Save Point Backend (v0.2)
+// Fix: userId passed explicitly for operator-scoped compatibility
 // ─────────────────────────────────────────────────────────────
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
@@ -8,28 +8,31 @@ declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
 // ── Configuration ────────────────────────────────────────────
 
 const CONFIG = {
-  // The comment used to identify the current Save Point entry
   SAVE_POINT_COMMENT: "Save Point — Current",
-  // World Book name where Save Points are stored
   WORLD_BOOK_NAME: "SAO Save Points",
-  // Template for archived Save Point comments
   ARCHIVE_COMMENT_PREFIX: "Save Point — ",
-  // The variable key for tracking the last save date
   LAST_SAVE_VARIABLE: "last_save_date",
-  // The variable key for tracking in-game date
   IN_GAME_DATE_VARIABLE: "in_game_date",
-  // The variable key for tracking current floor
   CURRENT_FLOOR_VARIABLE: "current_floor",
 };
 
-// ── Helper: Detect a new in-game day ─────────────────────────
+// ── Helper: Extract userId from interceptor context ──────────
 
 /**
- * Scans the generated message text for phrases indicating a new day has started.
- * Returns true if we find "next morning", "the following day", "the next day", etc.
- * 
- * This is intentionally simple for v0.1. We can expand the pattern list later.
+ * The interceptor context may include userId directly, or we may need
+ * to fall back to a default. For operator-scoped extensions, userId
+ * MUST be passed to every user-data API call.
  */
+function getUserId(ctx: { chatId: string; userId?: string }): string {
+  if (ctx.userId) return ctx.userId;
+  // Fallback: if ctx doesn't have userId, log a warning and return empty.
+  // This should not happen in normal operation, but prevents crashes.
+  spindle.log.warn("No userId in interceptor context. API calls may fail.");
+  return "";
+}
+
+// ── Helper: Detect a new in-game day ─────────────────────────
+
 function detectNewDay(text: string): boolean {
   const dayPatterns = [
     /\bthe next morning\b/i,
@@ -45,45 +48,37 @@ function detectNewDay(text: string): boolean {
   return dayPatterns.some((pattern) => pattern.test(text));
 }
 
-/**
- * Checks if the user sent a manual /save command.
- */
 function detectManualSave(userMessage: string): boolean {
   return /\bsave\b/i.test(userMessage) && userMessage.length < 20;
 }
 
 // ── Helper: Build the Save Point HTML template ────────────────
 
-/**
- * Assembles the full Save Point template from all available data sources.
- * This mirrors the behavior spec: queries Variables, World Books, and Memory Cortex,
- * then builds the collapsible <details> block.
- */
 async function buildSavePointTemplate(
   chatId: string,
+  userId: string,
   inGameDate: string,
   currentFloor: string
 ): Promise<string> {
   // ── Fetch Variables ──────────────────────────────────────
-  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests");
+  const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests", userId);
   const activeQuests = activeQuestsRaw ? activeQuestsRaw.split(",").map((q) => q.trim()) : [];
 
-  // ── Fetch Memory Cortex data (if available) ──────────────
+  // ── Fetch Memory Cortex data ─────────────────────────────
   let recentEvents: string[] = [];
   let characterThoughts: string[] = [];
   try {
-    // Try to get recent cortex memories
     const cortexResult = await spindle.memories.cortex.query({
       chatId,
       queryText: "recent events today",
       topK: 5,
+      userId,
     });
     recentEvents = cortexResult.memories.map((m) => m.content);
 
-    // Get active entities for character status
-    const entities = await spindle.memories.entities.list(chatId, { activeOnly: true });
+    const entities = await spindle.memories.entities.list(chatId, { activeOnly: true, userId });
     for (const entity of entities.slice(0, 10)) {
-      const facts = await spindle.memories.entities.getFacts(entity.id);
+      const facts = await spindle.memories.entities.getFacts(entity.id, userId);
       const thoughts = facts ? facts.slice(0, 1).join(" ") : "No recent data.";
       characterThoughts.push(
         `<div style="font-weight: 600; color: #1a1a1a;">${entity.name}</div>
@@ -91,17 +86,15 @@ async function buildSavePointTemplate(
       );
     }
   } catch {
-    // Memory Cortex might not be available—degrade gracefully
     recentEvents = ["Memory Cortex unavailable. Limited tracking active."];
     characterThoughts = ["Character data unavailable."];
   }
 
-  // ── Build Recent Developments ────────────────────────────
+  // ── Build HTML sections ──────────────────────────────────
   const developmentsHTML = recentEvents
     .map((event) => `<div style="padding: 3px 0;">• ${event}</div>`)
     .join("\n");
 
-  // ── Build Character Status ───────────────────────────────
   const characterHTML = characterThoughts
     .map(
       (thought) =>
@@ -109,7 +102,6 @@ async function buildSavePointTemplate(
     )
     .join("\n");
 
-  // ── Build Active Quests ──────────────────────────────────
   const questsHTML = activeQuests.length
     ? activeQuests
         .map(
@@ -132,79 +124,56 @@ async function buildSavePointTemplate(
     </div>
     <div style='font-size: 0.68em; color: #F1DC46; font-weight: 600; letter-spacing: 0.04em;'>▼ EXPAND</div>
   </summary>
-
   <div style='padding: 18px 20px;'>
-
-    <!-- Active Quests -->
     <div style='margin-bottom: 16px;'>
       <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📋 Active Quests</div>
-      <div style='font-size: 0.8em;'>
-        ${questsHTML}
-      </div>
+      <div style='font-size: 0.8em;'>${questsHTML}</div>
     </div>
-
-    <!-- Character Status -->
     <div style='margin-bottom: 16px;'>
       <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>👥 Character Status</div>
       ${characterHTML}
     </div>
-
-    <!-- Recent Developments -->
     <div style='margin-bottom: 16px;'>
       <div style='font-size: 0.7em; color: #6b7280; letter-spacing: 0.04em; text-transform: uppercase; padding-bottom: 4px; border-bottom: 1px solid #e0e3e7; margin-bottom: 8px;'>📊 Recent Developments</div>
-      <div style='font-size: 0.8em;'>
-        ${developmentsHTML}
-      </div>
+      <div style='font-size: 0.8em;'>${developmentsHTML}</div>
     </div>
-
   </div>
 </details>`;
 }
 
 // ── Helper: Find or create the Save Point World Book ──────────
 
-/**
- * Searches for an existing Save Point world book, or creates one if not found.
- * Returns the world book ID.
- */
-async function getOrCreateSavePointBook(): Promise<string> {
-  const { data: books } = await spindle.world_books.list({ limit: 50 });
+async function getOrCreateSavePointBook(userId: string): Promise<string> {
+  const { data: books } = await spindle.world_books.list({ limit: 50, userId });
   const existing = books.find((b) => b.name === CONFIG.WORLD_BOOK_NAME);
   if (existing) return existing.id;
 
   const newBook = await spindle.world_books.create({
     name: CONFIG.WORLD_BOOK_NAME,
     description: "Automated Save Point entries generated by the SAO Cardinal System extension.",
+    userId,
   });
   return newBook.id;
 }
 
 // ── Helper: Archive the previous Save Point ──────────────────
 
-/**
- * Finds the current Save Point entry (constant: true) and archives it:
- * sets constant: false, updates the comment with the archive prefix + date.
- */
-async function archivePreviousSavePoint(bookId: string, date: string): Promise<void> {
-  const { data: entries } = await spindle.world_books.entries.list(bookId, { limit: 100 });
+async function archivePreviousSavePoint(bookId: string, date: string, userId: string): Promise<void> {
+  const { data: entries } = await spindle.world_books.entries.list(bookId, { limit: 100, userId });
   const currentEntry = entries.find((e) => e.comment === CONFIG.SAVE_POINT_COMMENT);
 
   if (currentEntry) {
     await spindle.world_books.entries.update(currentEntry.id, {
       constant: false,
       comment: `${CONFIG.ARCHIVE_COMMENT_PREFIX}${date}`,
+      userId,
     });
   }
 }
 
 // ── Helper: Write the new Save Point entry ───────────────────
 
-/**
- * Creates a new Save Point entry in the world book.
- * Sets constant: true so it's always injected into context.
- * Sets position: 0 (before chat history) and priority: 100 (highest).
- */
-async function writeSavePoint(bookId: string, content: string): Promise<void> {
+async function writeSavePoint(bookId: string, content: string, userId: string): Promise<void> {
   await spindle.world_books.entries.create(bookId, {
     key: ["save_point", "daily_summary", "cardinal_system"],
     content,
@@ -212,41 +181,36 @@ async function writeSavePoint(bookId: string, content: string): Promise<void> {
     constant: true,
     position: 0,
     priority: 100,
+    userId,
   });
 }
 
 // ── Main: Process a potential Save Point trigger ─────────────
 
-/**
- * The core logic. Checks if a Save Point should fire, and if so,
- * builds the template, archives the old entry, and writes the new one.
- */
 async function processSavePoint(
   chatId: string,
+  userId: string,
   userMessage: string,
   generatedText: string
 ): Promise<boolean> {
-  // ── Check trigger conditions ────────────────────────────
   const isNewDay = detectNewDay(generatedText);
   const isManualSave = detectManualSave(userMessage);
-  
+
   if (!isNewDay && !isManualSave) return false;
 
-  // ── Get current state from Variables ────────────────────
-  const inGameDate = (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE)) || "Unknown Date";
-  const currentFloor = (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE)) || "1";
+  const inGameDate =
+    (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE, userId)) || "Unknown Date";
+  const currentFloor =
+    (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, userId)) || "1";
 
-  // ── Build the template ──────────────────────────────────
-  const template = await buildSavePointTemplate(chatId, inGameDate, currentFloor);
+  const template = await buildSavePointTemplate(chatId, userId, inGameDate, currentFloor);
 
-  // ── Write to World Book ─────────────────────────────────
   try {
-    const bookId = await getOrCreateSavePointBook();
-    await archivePreviousSavePoint(bookId, inGameDate);
-    await writeSavePoint(bookId, template);
+    const bookId = await getOrCreateSavePointBook(userId);
+    await archivePreviousSavePoint(bookId, inGameDate, userId);
+    await writeSavePoint(bookId, template, userId);
 
-    // Update the last save date variable
-    await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate);
+    await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate, userId);
 
     spindle.log.info(`Save Point written for ${inGameDate} (Floor ${currentFloor})`);
     return true;
@@ -258,12 +222,13 @@ async function processSavePoint(
 
 // ── Register the Interceptor ─────────────────────────────────
 
-/**
- * Hooks into every message-sent event. After the LLM generates a response,
- * we check if a Save Point trigger condition was met and process accordingly.
- */
 spindle.registerInterceptor(async (messages, ctx) => {
-  // We only care about the last user message and the generated response
+  const userId = getUserId(ctx);
+  if (!userId) {
+    spindle.log.warn("Save Point interceptor skipped: no userId available.");
+    return messages;
+  }
+
   const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
   const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
 
@@ -272,12 +237,10 @@ spindle.registerInterceptor(async (messages, ctx) => {
     const userText = typeof lastUserMsg.content === "string" ? lastUserMsg.content : "";
     const generatedText = typeof lastAssistantMsg.content === "string" ? lastAssistantMsg.content : "";
 
-    // Process Save Point (fire-and-forget—we don't modify the messages)
-    await processSavePoint(chatId, userText, generatedText);
+    await processSavePoint(chatId, userId, userText, generatedText);
   }
 
-  // Always return messages unchanged—we're observing, not modifying
   return messages;
 });
 
-spindle.log.info("SAO Cardinal System: Save Point interceptor registered.");
+spindle.log.info("SAO Cardinal System: Save Point interceptor registered (operator-scoped compatible).");
