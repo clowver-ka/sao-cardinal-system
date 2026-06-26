@@ -1,7 +1,7 @@
+typescript
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Backend v2.0
-// Interceptor-based architecture: detects narrative patterns and updates state
-// No tool calling required. Works with every LLM provider.
+// SAO Cardinal System — Backend v1.1
+// Tool-based architecture using spindle.registerTool() + TOOL_INVOCATION event
 // ─────────────────────────────────────────────────────────────
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
@@ -12,77 +12,127 @@ const CONFIG = {
   SAVE_POINT_COMMENT: "Save Point — Current",
   WORLD_BOOK_NAME: "SAO Save Points",
   ARCHIVE_COMMENT_PREFIX: "Save Point — ",
+  LAST_SAVE_VARIABLE: "last_save_date",
   IN_GAME_DATE_VARIABLE: "in_game_date",
   CURRENT_FLOOR_VARIABLE: "current_floor",
-  LAST_SAVE_VARIABLE: "last_save_date",
 };
 
-// ── Pattern Detection ────────────────────────────────────────
+// ── Register the update_variables tool ───────────────────────
 
-/**
- * Detects phrases indicating a new in-game day has started.
- * Returns the matched phrase if found, null otherwise.
- */
-function detectNewDay(text: string): string | null {
-  const patterns = [
-    { regex: /\bthe next morning\b/i, group: "morning" },
-    { regex: /\bthe following morning\b/i, group: "morning" },
-    { regex: /\bat dawn\b/i, group: "dawn" },
-    { regex: /\bat sunrise\b/i, group: "sunrise" },
-    { regex: /\bdawn broke\b/i, group: "dawn" },
-    { regex: /\bthe next day\b/i, group: "next_day" },
-    { regex: /\bthe following day\b/i, group: "next_day" },
-    { regex: /\bwakes? up\b/i, group: "wake" },
-    { regex: /\bwoke up\b/i, group: "wake" },
-  ];
-  for (const p of patterns) {
-    const match = text.match(p.regex);
-    if (match) return p.group;
+spindle.registerTool({
+  name: "update_variables",
+  display_name: "Update Story Variables",
+  description:
+    "Update chat variables that track story state—date, floor, combat status, party members, and active quests. The extension automatically triggers a Save Point when in_game_date changes. Call this whenever story-state changes: a new day begins, the party changes floors, combat starts/ends, quests are accepted/completed, or party membership changes.",
+  parameters: {
+    type: "object",
+    properties: {
+      in_game_date: {
+        type: "string",
+        description: 'Current in-game date, e.g. "November 6 2022". Update when a new day begins.',
+      },
+      current_floor: {
+        type: "string",
+        description: 'Current floor number as a string, e.g. "2". Update when the party changes floors.',
+      },
+      combat_active: {
+        type: "string",
+        description: '"true" or "false". Set when combat starts or ends.',
+      },
+      party_members: {
+        type: "string",
+        description: 'Comma-separated list of current party member names. Update when the party changes.',
+      },
+      active_quests: {
+        type: "string",
+        description: 'Comma-separated list of active quest names. Update when quests are accepted or completed.',
+      },
+    },
+  },
+  council_eligible: false, // This tool is for the primary LLM, not Council
+});
+
+spindle.log.info("SAO Cardinal System: Tool 'update_variables' registered.");
+
+// ── Handle tool invocations ──────────────────────────────────
+
+spindle.on("TOOL_INVOCATION", async (payload: any) => {
+  const { toolName, args, contextMessages } = payload;
+
+  if (toolName !== "update_variables") return "Unknown tool";
+
+  // ── Extract chatId ──────────────────────────────────────
+  // Try multiple sources: direct args, contextMessages metadata, or spindle.chats
+  let chatId = args._chatId || args.chatId || "";
+
+  // If not in args, try to get active chat via spindle.chats
+  if (!chatId) {
+    try {
+      // With install_scope: user, the extension runs in user context
+      // spindle.chats may expose the active chat without needing explicit userId
+      const activeChat = await (spindle as any).chats.getActive?.();
+      if (activeChat && activeChat.id) {
+        chatId = activeChat.id;
+        spindle.log.info(`ChatId resolved via getActive: ${chatId}`);
+      }
+    } catch {
+      // getActive may not exist; that's okay, we'll try other methods
+    }
   }
-  return null;
-}
 
-/**
- * Detects floor change patterns like "arrived on Floor 2" or "stepped onto the third floor".
- * Returns the floor number as a string if found, null otherwise.
- */
-function detectFloorChange(text: string): string | null {
-  // "Floor X" or "floor X" where X is a number or ordinal
-  const match = text.match(/\bfloor\s+(\d+)/i);
-  if (match) return match[1];
+  if (!chatId) {
+    spindle.log.warn("update_variables: No chatId available. Variables not updated.");
+    return "Error: Could not determine active chat. Variables not saved.";
+  }
 
-  // Ordinals: "first floor", "second floor", etc.
-  const ordinals: Record<string, string> = {
-    first: "1", second: "2", third: "3", fourth: "4", fifth: "5",
-    sixth: "6", seventh: "7", eighth: "8", ninth: "9", tenth: "10",
-  };
-  const ordinalMatch = text.match(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+floor\b/i);
-  if (ordinalMatch) return ordinals[ordinalMatch[1].toLowerCase()];
+  // ── Filter valid variable keys ──────────────────────────
+  const validKeys = ["in_game_date", "current_floor", "combat_active", "party_members", "active_quests"];
+  const updates: Record<string, string> = {};
 
-  return null;
-}
+  for (const key of validKeys) {
+    if (args[key] !== undefined && args[key] !== null) {
+      updates[key] = String(args[key]);
+    }
+  }
 
-/**
- * Detects combat start/end patterns.
- */
-function detectCombatStart(text: string): boolean {
-  return /\bcombat begins\b/i.test(text) || /\bdrew (her|his|their) weapon\b/i.test(text) || /\bthe (?:monster|enemy|boss) (?:lunged|charged|attacked|struck)\b/i.test(text);
-}
+  if (Object.keys(updates).length === 0) {
+    return "No variables to update.";
+  }
 
-function detectCombatEnd(text: string): boolean {
-  return /\bcombat (?:ended|concluded|resolved)\b/i.test(text) || /\bthe (?:monster|enemy|boss) (?:collapsed|fell|shattered|died|was defeated)\b/i.test(text);
-}
+  // ── Write variables ─────────────────────────────────────
+  // With install_scope: user, we don't need explicit userId—Spindle knows who we are
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      await spindle.variables.chat.set(chatId, key, value);
+      spindle.log.info(`Variable set: ${key} = ${value}`);
+    }
+  } catch (err) {
+    spindle.log.error(`Variable write failed: ${err}`);
+    return `Error: Failed to save variables. ${err}`;
+  }
 
-/**
- * Attempts to extract a date from the generated text.
- * Looks for common date formats: "November 6, 2022" or "November 6 2022"
- */
-function extractDate(text: string): string | null {
-  // Match "November 7, 2022" or "November 7 2022" or "November 7th, 2022" or "November 7th 2022"
-  const match = text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i);
-  if (match) return `${match[1]} ${match[2]} ${match[3]}`;
-  return null;
-}
+  // ── Auto-trigger Save Point if date changed ─────────────
+  if (updates[CONFIG.IN_GAME_DATE_VARIABLE]) {
+    const newDate = updates[CONFIG.IN_GAME_DATE_VARIABLE];
+    const currentFloor = updates[CONFIG.CURRENT_FLOOR_VARIABLE] || "1";
+
+    try {
+      const bookId = await getOrCreateSavePointBook();
+      await archivePreviousSavePoint(bookId, newDate);
+      const template = await buildSavePointTemplate(chatId, newDate, currentFloor);
+      await writeSavePoint(bookId, template);
+      await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, newDate);
+
+      spindle.log.info(`Save Point auto-triggered for ${newDate} (Floor ${currentFloor})`);
+      return `Variables updated: ${Object.keys(updates).join(", ")}. Save Point generated for ${newDate}.`;
+    } catch (err) {
+      spindle.log.error(`Save Point auto-trigger failed: ${err}`);
+      return `Variables updated: ${Object.keys(updates).join(", ")}. Save Point failed: ${err}`;
+    }
+  }
+
+  return `Variables updated: ${Object.keys(updates).join(", ")}.`;
+});
 
 // ── Save Point Template Builder ──────────────────────────────
 
@@ -91,6 +141,7 @@ async function buildSavePointTemplate(
   inGameDate: string,
   currentFloor: string
 ): Promise<string> {
+  // With user scope, we can call these without explicit userId
   const activeQuestsRaw = await spindle.variables.chat.get(chatId, "active_quests");
   const activeQuests = activeQuestsRaw ? activeQuestsRaw.split(",").map((q: string) => q.trim()) : [];
 
@@ -122,8 +173,9 @@ async function buildSavePointTemplate(
     .map((e) => `<div style="padding: 3px 0;">• ${e}</div>`)
     .join("\n");
   const characterHTML = characterThoughts
-    .map((t) =>
-      `<div style="font-size: 0.82em; padding: 8px 10px; background: #f8f9fa; margin-bottom: 6px;">${t}</div>`
+    .map(
+      (t) =>
+        `<div style="font-size: 0.82em; padding: 8px 10px; background: #f8f9fa; margin-bottom: 6px;">${t}</div>`
     )
     .join("\n");
   const questsHTML = activeQuests.length
@@ -151,6 +203,7 @@ async function buildSavePointTemplate(
 }
 
 // ── World Book Helpers ───────────────────────────────────────
+// No explicit userId needed — install_scope: user handles it
 
 async function getOrCreateSavePointBook(): Promise<string> {
   const { data: books } = await spindle.world_books.list({ limit: 50 });
@@ -185,158 +238,4 @@ async function writeSavePoint(bookId: string, content: string): Promise<void> {
   });
 }
 
-// ── Main: Process state changes and trigger Save Point ───────
-
-async function processStateChanges(chatId: string, generatedText: string): Promise<void> {
-  let variablesUpdated = false;
-  let shouldSavePoint = false;
-
-  // ── Check for date change ──────────────────────────────
-  const newDayType = detectNewDay(generatedText);
-  if (newDayType) {
-    spindle.log.info(`New day detected: ${newDayType}`);
-
-    // Try to extract a date from the text
-    const extractedDate = extractDate(generatedText);
-    if (extractedDate) {
-      await spindle.variables.chat.set(chatId, CONFIG.IN_GAME_DATE_VARIABLE, extractedDate);
-      spindle.log.info(`Date set from text: ${extractedDate}`);
-      variablesUpdated = true;
-      shouldSavePoint = true;
-    } else {
-      // No explicit date in text — increment from last known date
-      const lastDate = await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE);
-      if (lastDate && lastDate !== "") {
-        // Try to increment the date by one day
-        const incremented = incrementDate(lastDate);
-        if (incremented) {
-          await spindle.variables.chat.set(chatId, CONFIG.IN_GAME_DATE_VARIABLE, incremented);
-          spindle.log.info(`Date incremented: ${lastDate} → ${incremented}`);
-          variablesUpdated = true;
-          shouldSavePoint = true;
-        }
-      } else {
-        // No previous date — set a default starting date
-        await spindle.variables.chat.set(chatId, CONFIG.IN_GAME_DATE_VARIABLE, "November 6 2022");
-        spindle.log.info("Date defaulted to: November 6 2022");
-        variablesUpdated = true;
-        shouldSavePoint = true;
-      }
-    }
-  }
-
-  // ── Check for floor change ─────────────────────────────
-  const newFloor = detectFloorChange(generatedText);
-  if (newFloor) {
-    await spindle.variables.chat.set(chatId, CONFIG.CURRENT_FLOOR_VARIABLE, newFloor);
-    spindle.log.info(`Floor set: ${newFloor}`);
-    variablesUpdated = true;
-  }
-
-  // ── Check for combat start/end ─────────────────────────
-  if (detectCombatStart(generatedText)) {
-    await spindle.variables.chat.set(chatId, "combat_active", "true");
-    spindle.log.info("Combat started.");
-    variablesUpdated = true;
-  }
-  if (detectCombatEnd(generatedText)) {
-    await spindle.variables.chat.set(chatId, "combat_active", "false");
-    spindle.log.info("Combat ended.");
-    variablesUpdated = true;
-  }
-
-  // ── Trigger Save Point if date changed ─────────────────
-  if (shouldSavePoint) {
-    const inGameDate = (await spindle.variables.chat.get(chatId, CONFIG.IN_GAME_DATE_VARIABLE)) || "Unknown Date";
-    const currentFloor = (await spindle.variables.chat.get(chatId, CONFIG.CURRENT_FLOOR_VARIABLE)) || "1";
-
-    try {
-      const bookId = await getOrCreateSavePointBook();
-      await archivePreviousSavePoint(bookId, inGameDate);
-      const template = await buildSavePointTemplate(chatId, inGameDate, currentFloor);
-      await writeSavePoint(bookId, template);
-      await spindle.variables.chat.set(chatId, CONFIG.LAST_SAVE_VARIABLE, inGameDate);
-      spindle.log.info(`Save Point written for ${inGameDate} (Floor ${currentFloor})`);
-    } catch (err) {
-      spindle.log.error(`Save Point failed: ${err}`);
-    }
-  }
-
-  if (!variablesUpdated) {
-    spindle.log.info("No state changes detected.");
-  }
-}
-
-// ── Date Increment Helper ────────────────────────────────────
-
-/**
- * Attempts to increment a date string by one day.
- * Handles "Month Day Year" format (e.g., "November 6 2022").
- * This is a simple implementation — doesn't handle month boundaries perfectly,
- * but works well enough for SAO's month-long floor arcs.
- */
-function incrementDate(dateStr: string): string | null {
-  const months: Record<string, number> = {
-    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
-  };
-
-  const match = dateStr.match(/^(\w+)\s+(\d{1,2})\s+(\d{4})$/i);
-  if (!match) return null;
-
-  const month = match[1];
-  const day = parseInt(match[2], 10);
-  const year = parseInt(match[3], 10);
-
-  const monthNum = months[month.toLowerCase()];
-  if (!monthNum) return null;
-
-  // Simple increment — doesn't handle month-end boundaries
-  // SAO floors take weeks/months, so minor date drift is acceptable
-  const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  const maxDays = daysInMonth[monthNum - 1];
-
-  let newDay = day + 1;
-  let newMonth = month;
-  let newYear = year;
-
-  if (newDay > maxDays) {
-    newDay = 1;
-    const monthNames = Object.keys(months);
-    const nextMonthIndex = monthNum; // 0-indexed next month
-    if (nextMonthIndex < 12) {
-      newMonth = monthNames[nextMonthIndex];
-    } else {
-      newMonth = "January";
-      newYear = year + 1;
-    }
-  }
-
-  // Capitalize month name
-  const capitalized = newMonth.charAt(0).toUpperCase() + newMonth.slice(1).toLowerCase();
-  return `${capitalized} ${newDay} ${newYear}`;
-}
-
-// ── Register the Interceptor ─────────────────────────────────
-
-spindle.registerInterceptor(async (messages, ctx) => {
-  const chatId = ctx.chatId;
-
-  // Find the last assistant message (the LLM's just-generated response)
-  const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant");
-  if (!lastAssistantMsg) return messages;
-
-  const generatedText = typeof lastAssistantMsg.content === "string" ? lastAssistantMsg.content : "";
-
-  // Process any state changes detected in the generated text
-  try {
-    await processStateChanges(chatId, generatedText);
-  } catch (err) {
-    spindle.log.error(`Interceptor processing failed: ${err}`);
-  }
-
-  // Always return messages unchanged — we're observing, not modifying
-  return messages;
-});
-
-spindle.log.info("SAO Cardinal System: Backend v2.0 loaded — interceptor pattern detection active.");
+spindle.log.info("SAO Cardinal System: Backend v1.1 loaded — tool invocation handler active.");
