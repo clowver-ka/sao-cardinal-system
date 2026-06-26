@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-// SAO Cardinal System — Save Point Backend (v0.3)
+// SAO Cardinal System — Save Point Backend (v0.4)
 // Fix: fetch userId from chat object instead of ctx.userId
 // ─────────────────────────────────────────────────────────────
 
@@ -15,40 +15,6 @@ const CONFIG = {
   IN_GAME_DATE_VARIABLE: "in_game_date",
   CURRENT_FLOOR_VARIABLE: "current_floor",
 };
-
-// ── Cached userId (fetched once from chat object) ────────────
-
-let cachedUserId: string | null = null;
-
-/**
- * Gets the userId by querying the chat object.
- * The chat's owner is the user we need for all subsequent API calls.
- * Result is cached so we only make this query once per session.
- */
-async function getUserId(chatId: string): Promise<string> {
-  if (cachedUserId) return cachedUserId;
-
-  try {
-    // spindle.chats.get returns the chat object, which includes userId/ownerId
-    const chat = await spindle.chats.get(chatId);
-    if (chat && chat.userId) {
-      cachedUserId = chat.userId;
-      spindle.log.info(`UserId cached from chat: ${cachedUserId}`);
-      return cachedUserId;
-    }
-    // Fallback: some API versions use ownerId
-    if (chat && (chat as any).ownerId) {
-      cachedUserId = (chat as any).ownerId;
-      spindle.log.info(`UserId cached from chat (ownerId): ${cachedUserId}`);
-      return cachedUserId;
-    }
-  } catch (err) {
-    spindle.log.error(`Failed to fetch chat for userId: ${err}`);
-  }
-
-  spindle.log.warn("Could not determine userId from chat. Save Point will be skipped.");
-  return "";
-}
 
 // ── Helper: Detect a new in-game day ─────────────────────────
 
@@ -236,12 +202,14 @@ async function processSavePoint(
 }
 
 // ── Register the Interceptor ─────────────────────────────────
+// v0.4: userId is passed as a callback argument by the Spindle runtime
 
-spindle.registerInterceptor(async (messages, ctx) => {
-  // Fetch userId from chat object (cached after first call)
-  const userId = await getUserId(ctx.chatId);
-  if (!userId) {
-    spindle.log.warn("Save Point interceptor skipped: could not determine userId.");
+spindle.registerInterceptor(async (messages, ctx, userId) => {
+  // If userId came as third argument, use it. If not, check ctx.
+  const resolvedUserId = userId || (ctx as any).userId || (ctx as any).ownerId || "";
+
+  if (!resolvedUserId) {
+    spindle.log.warn("Save Point interceptor skipped: no userId in callback or context.");
     return messages;
   }
 
@@ -253,10 +221,10 @@ spindle.registerInterceptor(async (messages, ctx) => {
     const userText = typeof lastUserMsg.content === "string" ? lastUserMsg.content : "";
     const generatedText = typeof lastAssistantMsg.content === "string" ? lastAssistantMsg.content : "";
 
-    await processSavePoint(chatId, userId, userText, generatedText);
+    await processSavePoint(chatId, resolvedUserId, userText, generatedText);
   }
 
   return messages;
 });
 
-spindle.log.info("SAO Cardinal System: Save Point interceptor registered (v0.3 — userId from chat).");
+spindle.log.info("SAO Cardinal System: Save Point interceptor registered (v0.4 — userId from callback).");
