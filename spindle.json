@@ -1,0 +1,19 @@
+{
+  "version": "0.1.0",
+  "name": "SAO Cardinal System",
+  "identifier": "sao_cardinal_system",
+  "author": "Minami",
+  "github": "https://github.com/you/sao-cardinal-system",
+  "homepage": "https://github.com/you/sao-cardinal-system",
+  "description": "Narrative management system for SAO roleplay—Save Points, Quest Prophecies, Unit System, Spotlights, and diegetic messaging.",
+  "permissions": [
+    "world_books",
+    "variables",
+    "interceptor",
+    "tools",
+    "memories",
+    "generation"
+  ],
+  "entry_backend": "dist/backend.js",
+  "minimum_lumiverse_version": "0.1.0"
+}
