@@ -1,4 +1,3 @@
-typescript
 // ─────────────────────────────────────────────────────────────
 // SAO Cardinal System — Backend v1.1
 // Tool-based architecture using spindle.registerTool() + TOOL_INVOCATION event
